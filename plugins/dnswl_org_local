@@ -1,0 +1,295 @@
+#!/usr/bin/perl -w
+#
+#
+
+=head1 NAME
+
+dnswl_org_local - lookup dnswl.org information locally
+
+=head1 DESCRIPTION
+
+The B<dnswl_org_local> plugin uses the whitelist from 
+L<http://www.dnswl.org/> to set a connection note (C<dnswl_org_local>) 
+based on the score of the result.
+
+You need the rsynced generic-dnswl database on disk (or any other file
+with the same format), see L<http://www.dnswl.org/tech#rsync> on how to
+fetch it. Once the file changes on disk, this plugin will reread it in
+C<hook_pre_connection>. 
+
+=head1 CONFIGURATION
+
+Arguments for this plugin are key / value pairs, valid arguments are
+
+=over 4
+
+=item header (1|0)
+
+This will add a C<X-DNSWL:> header with the score (or C<No> if not whitelisted)
+to the message when set to a true value. Defaults to B<false>, i.e. not to add
+a header.
+
+=item file /PATH/TO/DNSWL_DB
+
+This specifies the full path to the F<generic-dnswl> database. This is the
+only required argument.
+
+=item ignore_fail (1|0)
+
+Do not set a connection note if host is not found, useful if this plugin is 
+running a second time with a smaller override list (B<use this for all but the
+first if you're running this plugin more than once>). Defaults to B<false>.
+
+=item wl_conn SCORE
+
+Set the connection note C<whitelisthost> if the dnswl score is greater or equal
+than SCORE. This note is read by several plugins from the qpsmtpd core 
+distribution (like C<check_earlytalker>, C<greylisting>, C<dnsbl>,...)
+
+=head1 ACCESSING DNSWL INFO
+
+Other plugins can get the score via
+  
+  my $score = $self->qp->connection->notes('dnswl');
+  $score = defined $score ? $score : -1;
+
+All other dnswl info about the connection can be found in the C<dnswl-info>
+connection note:
+
+  my $info = $self->qp->connection->notes('dnswl-info');
+  if (exists $info->{id}) {
+      # valid keys:
+      #    id (dnswl.org ID), 
+      #    domain (name or hostname), 
+      #    cat_id (category id),
+      #    category (category name),
+      #    score (numerical score),
+      #    mask (32bit netmask)...
+      ## to get dnswl net/mask entry:
+      ## $ip   = $self->qp->connection->remote_ip;
+      ## $net  = join(".", unpack("C4", pack("C4", split(/\./, $ip)) & $mask));
+      ## $mask = index(unpack("B*", $mask), "0", 0);
+      ## $entry = "$net/". (($mask < 0) : 32 : $mask);
+  }
+
+
+=head1 NOTES
+
+This plugin will add a memory footprint of ca. 12 MiB per process for keeping 
+the whitelist in memory. 
+
+If L<dnwsl.org> adds network masks < 16 (read: 15, 14, ...) the lookup
+mechanism has to be expanded.
+
+To override scores locally load this plugin a second time with a modified 
+subset of the database, put something like this in the plugins file: 
+
+ dnswl   file /var/lib/qpsmtpd/generic-dnswl
+ dnswl:0 file /var/lib/qpsmtpd/local ignore_fail 1
+
+To set some hosts more trusted than given in the DB we use something like
+
+ DNSWL_BASE=/var/lib/qpsmtpd
+ CHANGED=$( stat -c '%Y' $DNSWL_BASE/generic-dnswl ) 
+ rsync --times rsync1.dnswl.org::dnswl/generic-\* $DNSWL_BASE/
+ if [ $CHANGED -lt $(  stat -c '%Y' $DNSWL_BASE/generic-dnswl ) ]; then
+    awk -F";" -vOFS=";" '$4 ~ /^(debian|ubuntu|freedesktop)[.]/ {
+            $3 = "med";
+            print $0
+        }' > $DNSWL_BASE/local < $DNSWL_BASE/generic-dnswl
+    echo "192.168.1.0/24;10;hi;local;0" >> $DNSWL_BASE/local
+ fi
+
+To set an entry to untrusted at all, just set $3 to some invalid value, i.e.
+B<not>  "none", "low", "med" or "hi". Preferred value is "No".
+
+Add local whitelisted hosts as needed to the local DB, e.g like above
+
+  echo "192.168.1.0/24;10;hi;local;0" >> $DNSWL_BASE/local
+
+=cut
+
+use strict;
+use Time::HiRes qw(gettimeofday tv_interval);
+
+my %scores = (
+        "none" => 0,
+        "low"  => 1,
+        "med"  => 2,
+        "hi"   => 3,
+    );
+
+my %categories = (
+         2 => "Financial services",
+         3 => "Email Service Providers",
+         4 => "Organisations",
+         5 => "Service/network providers",
+         6 => "Personal/private servers",
+         7 => "Travel/leisure industry",
+         8 => "Public sector/governments",
+         9 => "Media and Tech companies",
+        10 => "some special cases",
+        11 => "Education, academic",
+        12 => "Healthcare",
+        13 => "Manufacturing/Industrial",
+        14 => "Retail/Wholesale/Services",
+        15 => "Email Marketing Providers",
+    );
+
+my $dnswl = {};
+
+sub register {
+    my ($self, $qp, %args) = @_;
+
+    $self->{_dnswl_file} = $args{file} || undef;
+    die "No dnswl-generic file given" 
+      unless defined  $self->{_dnswl_file};
+
+    $self->{_dnswl_time} = $self->read_dnswl($self->{_dnswl_file});
+    die "Unable to read file"
+      unless $self->{_dnswl_time};
+    
+
+    $self->{_dnswl_header} = exists $args{header} ? $args{header} : 0;
+    $self->register_hook("data_post", "add_header")
+      if $self->{_dnswl_header};
+
+    $self->{_dnswl_ignore} = exists $args{ignore_fail} ? $args{ignore_fail} : 0;
+
+    $self->{_dnswl_wl_conn} = exists $args{wl_conn} ? $args{wl_conn} : -1;
+
+    return (DECLINED);
+}
+
+sub add_header {
+    my ($self, $transaction) = @_;
+    $transaction->header->add("X-DNSWL", $self->{_dnswl_score}, 0)
+      if exists $self->{_dnswl_score};
+    return (DECLINED);
+}
+
+sub hook_pre_connection {
+    my $self   = shift;
+    my ($time) = (stat($self->{_dnswl_file}))[9] || 0;
+    if ($time > $self->{_dnswl_time}) {
+        $self->{_dnswl_time} = $self->read_dnswl($self->{_dnswl_file});
+    }
+    return (DECLINED);
+}
+
+sub hook_connect {
+    my ($self, $transaction) = @_;
+    my $remote = $self->qp->connection->remote_ip;
+
+    return (DECLINED)
+      unless $remote =~ /^(\d+\.){3}\d+$/; # IPv6 not supported currently
+
+    # my @start = gettimeofday;
+    my ($mask, $cat, $score, $dom, $id) = $self->lookup($remote);
+    # $self->log(LOGDEBUG, sprintf("lookup time of [$remote]: %.6f s", 
+    #                             tv_interval(\@start, [gettimeofday]))); 
+
+    if (defined $score) {
+        $self->{_dnswl_score} = $score;
+        $self->log(LOGDEBUG, "Whitelist for [$remote]: ID $id, "
+                        ."score: $score, $dom => $categories{$cat}");
+        $score = exists $scores{$score} ? $scores{$score} : -1;
+    }
+    else { # not found 
+        unless ($self->{_dnswl_ignore}) {
+            $self->{_dnswl_score} = "No";
+            $score = -1; 
+        }
+    }
+    
+    if (defined $score) {
+        $self->qp->connection->notes("whitelisthost", 1)
+          if (    $self->{_dnswl_wl_conn} > -1 
+              and $score >= $self->{_dnswl_wl_conn});
+
+        # undef if $self->{_dnswl_ignore} is true and not found
+        $self->qp->connection->notes("dnswl", $score);
+        defined $id
+          and $self->qp->connection->notes("dnswl-info",
+                {
+                    id       => $id,
+                    domain   => $dom,
+                    score    => $score,
+                    cat_id   => $cat,
+                    category => $categories{$cat},
+                    mask     => $mask, 
+                });
+        return (DECLINED, "dnswl score: $score");
+    }
+    return (DECLINED);
+}
+
+sub read_dnswl {
+    my ($self,$file) = @_;
+    my ($ip1, $ip2, $ip3, $ip4);
+    my ($ip, $mask, $cat, $score, $dom, $id);
+    my @read = gettimeofday;
+
+    open IN, $file
+      or $self->log(LOGERROR, "failed to open in file: $!\n"), 
+         return 0;
+
+    $dnswl = {}; # clear old db if file can be opened
+
+    my ($time) = (stat(IN))[9];
+    while (<IN>) {
+        next unless /^\d+\./;
+        # next if $. < 7;
+
+        ($ip, $cat, $score, $dom, $id) = split ';',  $_,  5;
+        ($ip, $mask)                   = split '/',  $ip, 2;
+        ($ip1, $ip2, $ip3, $ip4)       = split /\./, $ip, 4;
+        chomp $id;
+        $mask = pack "B32", "1"x($mask)."0"x(32-$mask);
+
+        $dnswl->{$ip1}->{$ip2}->{$ip3}->{$ip4} = [
+                $mask, $cat, $score, $dom, $id
+            ];
+    }
+    close IN;
+    $self->log(LOGDEBUG, sprintf("Reading done in %.3f seconds",
+                            tv_interval(\@read, [gettimeofday])));
+    return $time;
+}
+
+sub lookup {
+    my ($self, $ip) = @_;
+
+    my @p = split /\./, $ip;
+
+    return (undef, undef, undef, undef, undef)
+      unless exists $dnswl->{$p[0]}->{$p[1]};
+
+    return @{$dnswl->{$p[0]}->{$p[1]}->{$p[2]}->{$p[3]}}
+      if exists $dnswl->{$p[0]}->{$p[1]}->{$p[2]}->{$p[3]}; # X.X.X.X/32
+
+    $ip = pack "C4", @p; # use Socket; $ip = inet_aton($ip);
+
+    if (exists $dnswl->{$p[0]}->{$p[1]}->{$p[2]}) { # X.X.X.X/24-31
+        foreach (keys %{$dnswl->{$p[0]}->{$p[1]}->{$p[2]}}) {
+
+            return @{$dnswl->{$p[0]}->{$p[1]}->{$p[2]}->{$_}}
+              if (($ip & $dnswl->{$p[0]}->{$p[1]}->{$p[2]}->{$_}->[0]) 
+                    eq pack("C4", $p[0], $p[1], $p[2], $_));
+        }
+    }
+
+    if (exists $dnswl->{$p[0]}->{$p[1]}) { # X.X.X.X/16-23
+        foreach my $p2 (keys %{$dnswl->{$p[0]}->{$p[1]}}) {
+            foreach (keys %{$dnswl->{$p[0]}->{$p[1]}->{$p2}}) {
+
+                return @{$dnswl->{$p[0]}->{$p[1]}->{$p2}->{$_}}
+                  if (($ip & $dnswl->{$p[0]}->{$p[1]}->{$p2}->{$_}->[0])
+                       eq pack("C4", $p[0], $p[1], $p2, $_));
+            }
+        }
+    } 
+    return (undef, undef, undef, undef, undef); # not found
+}
+
+# vim: ts=4 sw=4 expandtab syn=perl
