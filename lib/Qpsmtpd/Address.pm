@@ -257,7 +257,6 @@ sub address {
 	my ($user, $host) = $self->canonify($val);
 	$self->{_user} = $user;
 	$self->{_host} = $host;
-        delete $self->{_has_rcpthost} if exists $self->{_has_rcpthost};
     }
     return ( defined $self->{_user} ?     $self->{_user} : '' )
          . ( defined $self->{_host} ? '@'.$self->{_host} : '' );
@@ -314,10 +313,7 @@ returned.
 
 sub host {
     my ($self, $host) = @_;
-    if (defined $host) {
-        $self->{_host} = $host;
-        delete $self->{_has_rcpthost} if exists $self->{_has_rcpthost};
-    }
+    $self->{_host} = $host if defined $host;
     return $self->{_host};
 }
 
@@ -354,55 +350,6 @@ sub _addr_cmp {
     }
 
     return ($left cmp $right);
-}
-
-=head2 has_rcpthost( )
-
-Returns true if the recipient domain is listed in the config files C<me>, 
-C<rcpthosts> or C<morercpthosts>.
-
-=cut
-
-sub has_rcpthost {
-    my $self = shift;
-    return $self->{_has_rcpthost} 
-      if exists $self->{_has_rcpthost};
-
-    my $host = $self->host;
-    my @rcpt_hosts = ($self->qp->config("me"), $self->qp->config("rcpthosts"));
-    
-    # Allow 'no @' addresses for 'postmaster' and 'abuse'
-    # qmail-smtpd will do this for all users without a domain, but we'll
-    # be a bit more picky.  Maybe that's a bad idea.
-    my $user = $self->user;
-    $host = $self->qp->config("me")
-      if ($host eq "" && (lc $user eq "postmaster" || lc $user eq "abuse"));
-    # XXX enable this? 
-    # if ($host eq "") {
-    #     $self->{_has_rcpthost} = 0;
-    #     return 0;
-    # }
-
-    # Check if this recipient host is allowed
-    for my $allowed (@rcpt_hosts) {
-        $allowed =~ s/^\s*(\S+)/$1/;
-        if ($host eq lc $allowed) {
-            $self->{_has_rcpthost} = 1;
-            return 1;
-        }
-        if (substr($allowed,0,1) eq "." and $host =~ m/\Q$allowed\E$/i) {
-            $self->{_has_rcpthost} = 1;
-            return 1;
-        }
-    }
-
-    my $more_rcpt_hosts = $self->qp->config('morercpthosts', 'map');
-    if (exists $more_rcpt_hosts->{$host}) {
-        $self->{_has_rcpthost} = 1;
-        return 1;
-    }
-    $self->{_has_rcpthost} = 0;
-    return 0;
 }
 
 =head1 COPYRIGHT
