@@ -1,0 +1,362 @@
+#
+# chunking - plugin for the CHUNKING SMTP extension
+# (RFC 1869, 1830/3030)
+#
+
+=head1 NAME
+
+chunking - plugin for the CHUNKING SMTP extension (RFC 1830/3030)
+
+=head1 DESCRIPTION
+
+The B<chunking> plugin adds the SMTP CHUNKING extension from RFC 3030
+``SMTP Service Extensions for Transmission of Large and Binary MIME Messages''
+to qpsmtpd.
+
+=head1 NOTE
+
+This plugin was never tested in the wild, so I don't know how real clients
+behave ... :-)
+
+Last time this plugin was tested was around qpsmtpd v0.40 or v0.43, it may
+not even run with >= 0.80 
+
+=head1 CONFIG
+
+This plugin just accepts one parameter:
+
+=head2 binarymime
+
+This enables the "BODY=BINARYMIME" MAIL FROM: parameter. If not present, it 
+will reject a
+  MAIL FROM:<sender@example.net> BODY=BINARYMIME
+
+with a 555 error (see RFC 1869).
+
+Don't enable unless you're sure the backend MTA can handle this.
+
+=head1 NOTES
+
+This plugin has never been tested with a real remote MTA
+
+DON'T USE :P
+
+=head1 TODO
+
+=over 4
+
+=item headers
+
+get headers earlier, so we can run a (currently non existing) C<data_headers>?
+hook... 
+
+B<NOTE>: C<data_headers_end> hook now exists, but this plugin has
+no support for it.
+
+=item CRLF
+
+s/\r?\n$/\n/: only in headers ... and in body when BODY=BINARYMIME was not?
+given
+
+=back
+
+=cut
+
+use Qpsmtpd::DSN;
+use POSIX qw(strftime);
+use Fcntl qw(:seek);
+
+our $reader;
+
+sub register {
+    my ($self, $qp, @args) = @_;
+    if (@args > 2) {
+        $self->log(LOGERROR, "Bad parameters for the chunking plugin")
+    }
+
+    $self->{_binarymime} = 0;
+    if (lc $args[0] eq 'binarymime') {
+        $self->{_binarymime} = 1;
+    }
+
+    $reader = 'read_block';
+    $self->{_bdat_block} = 4096;
+    if ($qp->{conn} && $qp->{conn}->isa('Apache2::Connection')) {
+        $reader = 'ap_read_block';
+        $self->{_bdat_block} = 8000;
+
+        require APR::Const;
+        APR::Const->import(qw(BLOCK_READ EOF SUCCESS TIMEUP));
+
+        # require APR::Socket;
+        # APR::Socket->import(qw());
+
+        require Apache2::Const;
+        Apache2::Const->import(qw(MODE_READBYTES));
+
+        require Apache2::Connection;
+        Apache2::Connection->import(qw());
+
+        require APR::Error;
+        APR::Error->import(qw());
+    }
+}
+
+sub hook_ehlo { # announce that we're able to do CHUNKING (and BINARYMIME)
+    my ($self, $transaction) = @_;
+    my $cap = $transaction->notes('capabilities');
+    $cap ||= [];
+    push @$cap, 'CHUNKING';
+    if ($self->{_binarymime}) {
+        push @$cap, 'BINARYMIME';
+    }
+    $transaction->notes('capabilities', $cap);
+    return(DECLINED);
+}
+
+sub hook_mail {
+    my ($self,$transaction,$sender,%params) = @_;
+    if (exists $params{'body'} && uc($params{'body'}) eq 'BINARYMIME') {
+        $transaction->notes('bdat_body_binarymime', 1);
+        unless ($self->{_binarymime}) {
+            my ($err) = 
+                (Qpsmtpd::DSN->proto_syntax_error(
+                    "BODY=BINARYMIME not supported AND not announced"))[1];
+            $self->qp->respond(555, $err);
+            return (DONE);
+        }
+    }
+    return (DECLINED);
+}
+
+sub hook_unrecognized_command {
+    my ($self, $transaction, $cmd, $size) = @_;
+    return (DECLINED) 
+      unless lc($cmd) eq 'bdat';
+
+    my ($err, $last);
+    my $msg_size = $transaction->notes('bdat_size') || 0;
+    
+    # DATA and BDAT commands cannot be used in the same transaction.  If a
+    # DATA statement is issued after a BDAT for the current transaction, a
+    # 503 "Bad sequence of commands" MUST be issued.  The state resulting
+    # from this error is indeterminate.  
+    if ($transaction->notes('bdat_data')) {
+        ($err) = 
+          (Qpsmtpd::DSN->proto_syntax_error("You cannot use BDAT and DATA"))[1];
+        $self->qp->respond(503, $err);
+        return (DONE);
+    }
+
+    # Any BDAT command sent after the BDAT LAST is illegal and
+    # MUST be replied to with a 503 "Bad sequence of commands" reply code.
+    # The state resulting from this error is indeterminate. A RSET command
+    # MUST be sent to clear the transaction before continuing.
+    if ($transaction->notes('bdat_last')) {
+        ($err) =
+            (Qpsmtpd::DSN->proto_syntax_error("Bad sequence of commands"))[1];
+        $self->qp->respond(503, $err);
+        return (DONE);
+    }
+
+    ($err) = 
+        (Qpsmtpd::DSN->proto_syntax_error("Syntax error in BDAT parameter"))[1];
+
+    if ($size =~ /^(\d+)\s*(\S+)?\s*$/) {
+        $size = $1;
+        $last = $2;
+    }
+    unless (defined $size && $size =~ /^\d+$/) {
+        $self->qp->respond(552, $err);
+        return (DONE);
+    }
+
+    if (!defined($last) or $last =~ /^$/) {
+        $last = $size ? 0 : 1;
+    }
+    else {
+        unless (uc($last) eq 'LAST') { # RFC says LAST all upper, we don't care
+            $self->qp->respond(552, $err);
+            return (DONE);
+        }
+        $last = 1;
+    }
+
+    $transaction->notes('bdat_bdat', 1); # remember we've seen BDAT
+
+    ## get a file to write the data chunks:
+    # ... open a new temporary file if it does not exist
+    my $file = $transaction->body_filename; 
+    my $fh   = $transaction->body_fh; # and get the fh for the open file
+    seek($fh, 0, SEEK_END)
+      or $self->log(LOGERROR, "failed to seek: $!"),
+         $self->qp->respond(452, "Temporary storage allocation error"), 
+         return (DONE);
+
+    # we're at the end of the file, now read the chunk (and write it to $fh)
+    my $sum  = 0;
+    my ($buffer, $bytes, $left) = ("", 0, 0);
+
+    my $block = $self->{_bdat_block};
+    my ($rc, $msg);
+    while ($sum < $size) {
+        ($buffer, $bytes, $rc, $msg) = $self->$reader($block);
+        if ($rc) {
+            $self->log(LOGERROR, "Failed to read: $msg");
+            $self->qp->respond($rc, $msg);
+            return (DONE);
+        }
+        if (!defined $buffer or !$bytes) {
+            $self->log(LOGERROR, "Failed to read: $!");
+            $self->qp->respond(452, "Error reading your data");
+            return (DONE);
+        }
+        print $fh $buffer
+            or $self->log(LOGERROR, "Failed to write: $!"),
+               $self->qp->respond(452, "Temporary storage allocation error"), 
+               return (DONE);
+
+        $sum  += $bytes;
+        $left  = $size - $sum;
+        $block = ($left < $block) ? $left : $block;
+    }
+    # ok, got the chunk on disk
+    $self->log(LOGDEBUG, "OK, got the chunk of $size bytes, LAST=$last");
+
+    # let's see if the mail is too big... 
+    # ...we can't do this before reading the chunk, because the BDAT command
+    # requires us to read the chunk before responding
+    my $max = $self->qp->config('databytes');
+    if ($max && (($msg_size + $size) > $max)) {
+        $self->qp->respond(552, "Message too big!");
+        # $self->qp->reset_transaction; ### FIXME: reset here?
+        return(DONE);
+    }
+    $transaction->notes('bdat_size', $msg_size + $size);
+
+    unless ($last) { # get the next chunk
+        $self->qp->respond(250, "Ok, got $size octets");
+        return(DONE);
+    } 
+    # else 
+    
+    # ... get the headers, run data_post & queue hooks
+    $transaction->notes('bdat_last', 1);
+    seek($fh, 0, SEEK_SET)
+      or $self->log(LOGERROR, "Failed to seek: $!"),
+         $self->qp->respond(452, "Temporary storage allocation error"), 
+         return (DONE);
+
+    $buffer = "";
+    while (<$fh>) {
+        if (/^\r?\n$/) {
+            seek($fh, -length($_), SEEK_CUR);
+            # the body starts here...
+            $self->transaction->set_body_start();
+            last;
+        }
+        s/\r\n$/\n/;
+        $buffer .= $_;
+        # if (length($buffer) > 50_000) ;
+        #     $self->qp->respond(500, "Header size too large")
+        #     return (DONE);
+        # }
+    }
+
+    my $header = Mail::Header->new(Modify => 0, MailFrom => "COERCE");
+    my @header = split /^/m, $buffer;
+    # undef $buffer;
+    $header->extract(\@header);
+    $self->transaction->header($header);
+
+    my $rcvd_line;
+    ($rc, $rcvd_line) = $self->qp->run_hooks("received_line");
+    if ($rc != OK or not $rcvd_line) {
+        my $authheader = (defined $self->{_auth} and $self->{_auth} == OK) 
+            ?  "\t(smtp-auth username $self->{_auth_user}, "
+              ."mechanism $self->{_auth_mechanism})\n" 
+            : "";
+
+        $rcvd_line = "from ".$self->connection->remote_info
+             # can/should/must this be EHLO instead of HELO?
+            ." (HELO ".$self->connection->hello_host.")"
+            ." (". $self->connection->remote_ip. ")\n "
+            .$authheader
+            ."\tby ".$self->qp->config('me')." (qpsmtpd/".$self->qp->version.") "
+            # no need for SMPT/ESMTP diff, we know we've just received 
+            # via ESMTP (EHLO)
+            ."with ESMTP". ($authheader ? "A" : "")."; " # ESMPTA: RFC 3848
+            .(strftime('%a, %d %b %Y %H:%M:%S %z', localtime));
+    }
+    $header->add("Received", $rcvd_line, 0);
+    
+    # everything done for running data_post... 
+    # this will call the spamassassin, virus scanner and queue plugins 
+    # for us and do all the cleanup stuff
+    # ... in earlier versions (pre 0.40) of qpsmtpd we had to handle the
+    # return codes and do all the stuff
+    $self->qp->run_hooks("data_post");
+
+    # BDAT (0( LAST)?|$num LAST) is always the end of a "transaction"
+    $self->qp->reset_transaction; # ... doesn't matter if it had done before
+    return (DONE);
+}
+
+sub ap_read_block {
+    my ($self, $block_size) = @_; 
+    my $conn = $self->qp->{conn};
+    return (undef, 0, 452, "You don't see this, your connection is dead")
+      if $conn->aborted;
+
+    my $buffer;
+
+### This does not work if the client does not fetch the response after
+### every BDAT command... why should he fetch it, we're offering PIPELINING 
+#    my $sock    = $conn->client_socket;
+#    my $bytes   = eval { $sock->recv($buffer, $block_size) }; 
+#    if ($@ && ref $@ && $@ == APR::Const::TIMEUP()) {
+#        return (undef, 0, 452, "Timeout reading your data");
+#    }
+#    return ($buffer, $bytes);    
+
+    my $bb = $self->qp->{bb_in};
+    my $rc = $conn->input_filters->get_brigade($bb, 
+                        Apache2::Const::MODE_READBYTES(), 
+                        APR::Const::BLOCK_READ(), 
+                        $block_size);
+    return (undef, 0, 452, "You don't see this, got EOF") 
+      if $rc == APR::Const::EOF();
+    die APR::Error::strerror($rc)
+      unless $rc == APR::Const::SUCCESS();
+
+    $bb->flatten($buffer);
+    $bb->cleanup;
+    return ($buffer, length($buffer));
+}
+
+sub read_block {
+    my ($self, $block_size) = @_; 
+    my ($bytes, $buffer);
+    $bytes = read(STDIN, $buffer, $block_size);
+
+    return (undef, 0, 452, "Failed to read your data")
+      unless $bytes;
+    return ($buffer, $bytes);
+}
+
+sub hook_data {
+    my ($self, $transaction) = @_;
+    if ($transaction->notes('bdat_body_binarymime') 
+        || $transaction->notes('bdat_bdat')) 
+    {
+        my ($err) =
+            (Qpsmtpd::DSN->proto_syntax_error("Bad sequence of commands"))[1];
+        $self->qp->respond(503, $err);
+        return (DONE);
+    }
+    $transaction->notes('bdat_data', 1); # remeber we've seen DATA
+
+    return(DECLINED);
+}
+
+# vim: ts=4 sw=4 expandtab syn=perl
