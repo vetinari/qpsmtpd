@@ -1,0 +1,248 @@
+
+=head1 NAME
+
+pipeline_sync - advanced version of the check_earlytalker plugin
+
+=head1 DESCRIPTION
+
+This plugin checks if the remote host honours RFC 1854 (SMTP Service Extension
+for Command Pipelining), which we announce:
+
+ ``The EHLO, DATA, VRFY, EXPN, TURN, QUIT, and NOOP commands can 
+   only appear as the last command in a group since their success 
+   or failure produces a change of state which the client SMTP 
+   must accommodate. (NOOP is included in this group so it can be 
+   used as a synchronization point.)''
+
+The B<pipeline_sync> plugin may be configure to check at EHLO/HELO, DATA,
+VRFY and NOOP. QUIT would be to late anyway and the other commands are not
+supported by qpsmtpd. Any data sent by the client before the configured 
+timeout is a no-go and the hook returns with the specified action.
+
+=head1 CONFIGURATION
+
+Arguments are key/value pairs. Setting the TIMEOUT values below to C<0> 
+disables the checks for the given hook. You may specify also an action, 
+separated by a C<,>. Known arguments are:
+
+=over 4
+
+=item connect TIMEOUT[,ACTION]
+
+Wait TIMEOUT seconds at connect before sending out the greeting banner, default
+timeout is C<1>.
+
+=item data TIMEOUT[,ACTION]
+
+Wait TIMEOUT seconds before sending the C<354> message to the client, default
+timeout is C<1>.
+
+=item noop TIMEOUT[,ACTION]
+
+Wait TIMEOUT seconds before returning C<250 OK> to the client, this check is
+disabled by default.
+
+=item vrfy TIMEOUT[,ACTION]
+
+Wait TIMEOUT seconds before the other hook_vrfy() do something, this check is
+disabled by default.
+
+=item action DENY(SOFT)?(_DISCONNECT)?
+
+This sets the default action: Sent (a temporary) error to the client and
+optionally disconnect, see F<docs/plugins.pod> and F<Qpsmtpd::Constants> for
+more info about the DENY, DENYSOFT, DENY_DISCONNECT and DENYSOFT_DISCONNECT
+constants.
+
+Default action is C<DENY>.
+
+=item defer BOOLEAN
+
+If set to a true value, clients talking before the greeting banner will be 
+punished after sending C<MAIL FROM> instead of immediately. Default is NOT
+to defer pubishing.
+
+=back
+
+=head1 NOTES
+
+C<hook_vrfy()> does currently not support DENYSOFT* and DENY_DISCONNECT.
+
+C<hook_noop()> does currently not support DENYSOFT*.
+
+Drop me a note if you want to use one of the above.
+
+=head1 AUTHOR
+
+Based on the check_earlytalker plugin from the qpsmtpd distribution.
+
+(c) 2008, Hanno Hecker <vetinari@ankh-morp.org>
+
+This software is free software and may be distributed under the same
+terms as qpsmtpd itself.
+
+=cut
+
+use IO::Select;
+
+use warnings;
+use strict;
+
+sub register {
+    my ($self, $qp, %args) = @_;
+
+    $self->{_is_apache}  = 0;
+    $self->{_def_action} = "DENY";
+    $self->{_defer}      = 0;
+    my %checks = (    # default values... timeout in seconds
+                   'connect' => 1,
+                   'data'    => 1,
+                   'vrfy'    => 0,
+                   'noop'    => 0,
+                 );
+    my %actions = (
+                   'connect' => 0,
+                   'data'    => 0,
+                   'vrfy'    => 0,
+                   'noop'    => 0,
+                  );
+
+    foreach my $key (keys %args) {
+        if (exists $checks{$key}) {
+            next
+              unless $args{$key} =~ /^(\d+)(,(DENY(SOFT)?(_DISCONNECT)?))?$/i;
+            $checks{$key}  = $1;
+            $actions{$key} = Qpsmtpd::Constants::return_code(uc $3)
+              if $3;
+            ## $self->log(LOGDEBUG, "ACTION=$actions{$key} => $3") if $3;
+        }
+        elsif ($key eq "action") {
+            next unless $args{"action"} =~ /^DENY(SOFT)?(_DISCONNECT)?$/i;
+            $self->{_def_action} =
+              Qpsmtpd::Constants::return_code(uc $args{"action"});
+        }
+        elsif ($key eq "defer-reject") {
+            $self->{_defer} = $args{"defer-reject"} ? 1 : 0;
+        }
+    }
+    $self->{_checks}  = \%checks;
+    $self->{_actions} = \%actions;
+
+    if ($qp->{conn} && $qp->{conn}->isa('Apache2::Connection')) {
+        require APR::Const;
+        APR::Const->import(qw(POLLIN SUCCESS));
+        $self->{_is_apache} = 1;
+    }
+
+    #    elsif ($self->qp->isa('Qpsmtpd::Threaded') {
+    #        $self->{_is_threaded} = 1;
+    #    }
+    1;
+}
+
+sub sync_check {
+    my $self = shift;
+
+    my $hook = $self->hook_name();
+    my $timeout = $self->{_checks}->{$hook} || 0;
+    ## print STDERR "hook = $hook(), timeout = $timeout\n";
+    return (DECLINED) unless $timeout;
+
+    return DECLINED
+      if ($self->qp->connection->notes('whitelistclient'));
+
+    my $rc = 0;
+    if ($self->{_is_apache}) {
+        $rc = $self->wait_apache($timeout);
+    }
+
+    #    elsif ($self->{_is_threaded}) {
+    #        $rc = $self->wait_threaded($timeout);
+    #    }
+    else {
+        $rc = $self->wait_qpsmtpd($timeout);
+    }
+    return (DECLINED,
+            "remote host said nothing spontaneous at hook_$hook(), proceeding")
+      unless ($rc);
+
+    my $ip = $self->qp->connection->remote_ip;
+    my $action = $self->{_actions}->{$hook} || $self->{_def_action};
+    $_ = $hook;
+    /^connect$/
+      and do {
+        $self->log(LOGNOTICE,
+                   "remote host [$ip] started talking before we said hello");
+        if ($self->{_defer}) {
+            $self->qp->connection->notes('earlytalker', 1);
+            return (DECLINED);
+        }
+        return ($action,
+                "Connecting host started transmitting before SMTP greeting");
+      };
+
+    /^data$/
+      and $self->log(LOGNOTICE,
+                 "remote host [$ip] started with message before we allowed to"),
+      return ($action, "I wasn't ready to receive your message");
+
+    /^noop$/
+      and $self->log(LOGNOTICE, "remote host [$ip] didn't wait after NOOP"),
+      return ($action, "NOOP took longer than you expected?");
+
+    /^vrfy$/
+      and $self->log(LOGNOTICE,
+                     "remote host [$ip] didn't wait for address verification"),
+      return ($action,
+              "Not enough time to wait for verification of recipient?");
+
+    return (DECLINED);    # how did we get here?
+}
+
+*hook_connect = *hook_data = *hook_noop = *hook_vrfy = \&sync_check;
+
+sub hook_mail {
+    my $self = shift;
+    return (DECLINED)
+      unless ($self->{_defer} and $self->qp->connection->notes('earlytalker'));
+    my $action = $self->{_actions}->{connect} || $self->{_def_action};
+    return ($action,
+            "Connecting host started transmitting before SMTP greeting");
+}
+
+sub wait_apache {
+    my ($self, $timeout) = @_;
+
+    $timeout *= 1_000_000;
+
+    my $c      = $self->qp->{conn};
+    my $socket = $c->client_socket;
+
+    my $rc = $socket->poll($c->pool, $timeout, APR::Const::POLLIN());
+    return 1 if ($rc == APR::Const::SUCCESS());
+
+    return 0;
+}
+
+sub wait_qpsmtpd {
+    my ($self, $timeout) = @_;
+    my $in = new IO::Select;
+
+    $in->add(\*STDIN) || return 0;
+    return 1 if $in->can_read($timeout);
+
+    return 0;
+}
+
+#sub wait_threaded {
+#    my ($self, $timeout) = @_;
+#    my $in = new IO::Select;
+#
+#    $in->add($self->qp->_socket) || return 0;
+#    return 1 if $in->can_read($timeout);
+#
+#    return 0;
+#}
+1;
+
+# vim: ts=4 sw=4 expandtab syn=perl
