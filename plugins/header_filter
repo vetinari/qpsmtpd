@@ -1,0 +1,166 @@
+
+=head1 NAME
+
+header_filter - filter (drop) mails based on certain header fields
+
+=head1 DESCRIPTION
+
+The B<header_filter> can drop mails just by some header fields. This was
+written to drop mails by known spam I<Subject:>s, but may be used to drop 
+mails by any header fields. 
+
+=head1 CONFIG
+
+The plugin uses the I<header_filter> config file. This file contains lines
+with four (or three) fields, separated by white space.
+The first field is the name of the header to look at, the second field either
+a string or a perl regex surrounded by ``/''. Both (string/regex) are of 
+course without any spaces inside. If you need spaces, use a regex with I<\s>
+or I<\x20>. Before matching any I<\t> (TAB), I<\r> (CR) and I<\n> (LF) are 
+replaced by a space (" "). Strings are compared case sensitive, regexes 
+case insensitive.
+
+Any $RCPT, $RCPT_HOST, $RCPT_USER in a regexp will be replaced by the first
+recipient's address, host part of address, local part of address. Same for
+$FROM, $FROM_HOST, $FROM_USER.
+
+The third field is a (valid) return constant from Qpsmtpd::Constants. Lines 
+with invalid constants are ignored and B<OK> or B<DONE> are mapped to 
+B<DECLINED>.
+
+The last optional field (which may contain spaces) is the message which is
+returned with the constant to qpsmtpd if the regex (or string) matches.
+
+=head1 EXAMPLE
+
+ Subject /^Re:(\s*\d+)?\s+V\S*A\S*GH?RA\s*$/   DENY Spam... detected
+ Subject /^(It's\s+\S+|\S+\s+here)\s+\:\)\s*$/ DENY Spam... detected
+ Subject Hi                                    DENY Spam... detected
+ ## only use if you're the only MX for $RCPT_HOST and your hostname is
+ ## not $RCPT_HOST!
+ Received /^from.*by\s+$RCPT_HOST\s+with\s+esmtp.*for\s+$RCPT\s*;/ DENY Spam
+
+=cut
+
+use Qpsmtpd::Constants;
+use Qpsmtpd::DSN;
+
+sub hook_data_post {
+    my ($self, $transaction) = @_;
+    my ($header, $re, $const, $comment, $str, $ok, $err);
+    my $line = 0;
+
+    my ($RCPT, $RCPT_HOST, $RCPT_USER, $FROM, $FROM_HOST, $FROM_USER);
+    my @rcpt = $self->transaction->recipients;
+    $RCPT_HOST = $rcpt[0]->host;
+    $RCPT_USER = $rcpt[0]->user;
+    $RCPT      = $RCPT_USER . '@' . $RCPT_HOST;
+    $RCPT_HOST = quotemeta $RCPT_HOST;
+    $RCPT_USER = quotemeta $RCPT_USER;
+    $RCPT      = quotemeta $RCPT;
+
+    my $from = $self->transaction->sender;
+    $FROM_HOST = $from->host || "";
+    $FROM_USER = $from->user || "";
+    $FROM      = $FROM_USER . '@' . $FROM_HOST;
+    if ($FROM =~ /\@$/) {
+        $FROM = "<>";
+    }
+    $FROM_HOST = quotemeta $FROM_HOST;
+    $FROM_USER = quotemeta $FROM_USER;
+    $FROM      = quotemeta $FROM;
+
+    foreach my $cfg ($self->qp->config("header_filter")) {
+        $cfg =~ s/^\s*//;
+        ($header, $re, $const, $comment) = split /\s+/, $cfg, 4;
+        ++$line;
+        $str = undef;
+
+        unless (defined $re) {
+            $self->log(LOGWARN,
+                       "header_filter - no regex/string in line $line");
+            next;
+        }
+
+        if ($re =~ m#^/(.*)/$#) {    ## <-- make vim's syntax hilight happy :-)
+            $re = $1;
+
+            $re =~ s/\$FROM_HOST/$FROM_HOST/g;
+            $re =~ s/\$FROM_USER/$FROM_USER/g;
+            $re =~ s/\$FROM/$FROM/g;
+            $re =~ s/\$RCPT_HOST/$RCPT_HOST/g;
+            $re =~ s/\$RCPT_USER/$RCPT_USER/g;
+            $re =~ s/\$RCPT/$RCPT/g;
+
+            $ok = eval { $re = qr/$re/i; };
+            if ($@) {
+                ($err = $@) =~ s/\s*at \S+ line \d+\.\s*$//;
+                $self->log(LOGWARN,
+                           "REGEXP '$re' not valid (line $line): $err");
+                next;
+            }
+
+            # $self->log(LOGWARN, "RE='$re', OK='$ok'");
+            $re = $ok;
+        }
+        else {
+            $str = $re;
+        }
+
+        unless (defined $const) {
+            $self->log(LOGWARN, "header_filter - no return code in line $line");
+            next;
+        }
+
+        $ok    = $const;
+        $const = Qpsmtpd::Constants::return_code($const);
+        unless (defined $const) {
+            $self->log(LOGWARN,
+                           "header_filter - '$ok' is not a valid constant, "
+                         . "ignoring line $line"
+                      );
+            next;
+        }
+
+        foreach my $hdr ($transaction->header->get($header)) {
+            $hdr =~ s/[\r\n\t]+/ /sg;
+            $hdr =~ s/^\s*//;
+            if (defined $str) {
+                next unless $str eq $hdr;
+                $self->log(LOGDEBUG,
+                               "String $str from line $line "
+                             . "matched header '$header: $hdr', "
+                             . "returning $ok"
+                          );
+            }
+            else {
+                next unless $hdr =~ $re;
+                $self->log(LOGDEBUG,
+                               "RE $re from line $line "
+                             . "matched header '$header: $hdr', "
+                             . "returning $ok"
+                          );
+            }
+            if ($const == OK || $const == DECLINED || $const == DONE) {
+                return (DECLINED);
+            }
+            else {
+                return
+                  Qpsmtpd::DSN->media_unsupported($const,
+                                      ($comment || "Some header field denied"));
+            }
+        }
+    }
+    return (DECLINED);
+}
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (c) 2006 Hanno Hecker
+
+This plugin is licensed under the same terms as the qpsmtpd package itself.
+Please see the LICENSE file included with qpsmtpd for details.
+
+=cut
+
+# vim: ts=4 sw=4 expandtab syn=perl
