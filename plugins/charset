@@ -1,0 +1,94 @@
+
+=head1 NAME
+
+charset - filter messages based on the given charset of the Content-Type
+
+=cut 
+
+use Qpsmtpd::ContentType;
+use Qpsmtpd::DSN;
+
+=head1 DESCRIPTION
+
+This plugin uses the B<Qpsmtpd::ContentType> module and looks in the 
+I<Content-Type:> header for the I<text/*; charset=NAME> parameter. If it
+matches one given in the B<charsets> config file it will act on it.
+
+=head1 CONFIG
+
+The plugin takes no arguments. It reads the charset, a return code (which must
+be a vaild return code from I<Qpsmtpd::Constants>) and an optional message
+from the B<charsets> config file.
+
+=head1 EXAMPLE
+
+This is an example B<charsets> config file.
+
+ iso-2022-jp   DENY Charset iso-2022-jp not accepted here
+ shift-jis     DENY Charset shift-jis not accepted here
+ koi8-r        DENY Charset koi8-r not accepted here
+ GB2312        DENY Charset GB2312 not accepted here
+ big5          DENY Charset big5 not accepted here
+
+Charset names are case insensitive and any ``_'' will be replaced by
+a ``-''.
+
+=head1 HINTS
+
+Don't DENY an "us-ascii" charset, as this is the default for messages 
+without a I<Content-Type:> header (see RFC 1521).
+
+=cut
+
+sub hook_data_post {
+    my ($self, $transaction) = @_;
+    my %charsets;
+
+    # let's see if some other plugins have parsed the Content-Type
+    # header before us
+    my $ct = $transaction->notes('Content-Type');
+    unless ($ct) {
+
+        # no? ok, remember it for the following plugins
+        my $ct_head = $transaction->header->get('Content-Type');
+        $ct = Qpsmtpd::ContentType->parse($ct_head);
+        $transaction->notes('Content-Type', $ct);
+    }
+
+    ## XXX: Don't enable until you're 110% sure I made no mistake
+    ##      in the Qpsmtpd::ContentType module AND you just get broken
+    ##      Content-Type headers from spam only sources (which is quite
+    ##      unlikely)
+    # return Qpsmtpd::DSN->media_unsupported(DENY,
+    #         "Malformed Content-Type header: ".$ct->error)
+    #   if $ct->illegal;
+
+    if ($ct->type eq 'text') {
+        my $cset = lc $ct->param('charset');
+        $cset =~ tr/_/-/;
+
+        my %cs = map { split ' ', $_, 2; } $self->qp->config('charsets');
+        foreach my $k (keys %cs) {
+            $charsets{lc $k} = $cs{$k};
+            $charsets{lc $k} =~ tr/_/-/;
+        }
+        return (DECLINED) unless exists $charsets{$cset};
+
+        my ($code, $msg) = split ' ', $charsets{$cset}, 2;
+        $code = uc $code;
+        if ($code eq 'OK' || $code eq 'DECLINED' || $code eq 'DONE') {
+            return (DECLINED);
+        }
+
+        my $ret = Qpsmtpd::Constants::return_code($code);
+        unless (defined $ret) {
+            $self->log(LOGWARN, "Unknown return code $code...");
+            return (DECLINED);
+        }
+        return Qpsmtpd::DSN->media_unsupported($ret,
+                                               ($msg || 'Content-Type denied'));
+    }
+    return (DECLINED);
+}
+
+# vim: ts=4 sw=4 expandtab syn=perl
