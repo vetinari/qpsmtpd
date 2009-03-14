@@ -1,0 +1,75 @@
+
+=head1 NAME
+
+rcpt_regexp_map - helper plugin for rcpt_map and rcpt_regexp
+
+=head1 DESCRIPTION
+
+This plugin works with the B<rcpt_map> plugin, it B<replaces> the
+B<rcpt_regexp> plugin line in the F<config/plugins> file:
+ 
+ # OLD:
+ ## rcpt_regexp
+ ## rcpt_map   domain=example.org file=./config/map_example_org
+ ## rcpt_map:0 domain=example.com file=./config/map_example_com
+ # NEW: 
+ rcpt_regexp_map example.org example.com
+ rcpt_map   domain=example.org file=./config/map_example_org
+ rcpt_map:0 domain=example.com file=./config/map_example_com
+
+When using the B<rcpt_map> plugin like described in the I<NOTES> section
+of B<rcpt_map> the B<rcpt_regexp> plugin will return C<550 No such user.>
+for any user not listed in the F<rcpt_regexp> config file, no matter if the
+domain is listed in the F<rcpthosts> config file.
+
+This plugin returns C<550 Relaying denied> for any domain B<not> given as
+argument or listed in the F<rcpthosts> config file.
+
+=head1 CONFIG
+
+ rcpt_regexp_map DOMAIN [DOMAIN2 [DOMAIN3 [...]]]
+
+All domains which will have their own B<rcpt_map> plugin should be listed
+as argument for this plugin.
+
+=head1 NOTE
+
+This changes the behaviour of the F<rcpthosts> config file: it is just
+checked if a domain exists. No support for leading dots.
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (c) 2009 Hanno Hecker
+
+This plugin is licensed under the same terms as the qpsmtpd package itself.
+Please see the LICENSE file included with qpsmtpd for details.
+
+=cut
+
+use Qpsmtpd::DSN;
+
+sub init {
+    my ($self, $qp, @args) = @_;
+    die "No args given"
+      unless @args;
+    %{$self->{_map}} = map { ($_ => 1) } @args;
+    $self->isa_plugin("rcpt_regexp");
+}
+
+sub hook_rcpt {
+    my ($self, $transaction, $recipient) = @_;
+    return (DECLINED)
+      unless $recipient->host;
+    my $host = lc $recipient->host;
+
+    return (DECLINED)
+      if exists $self->{_map}->{$host};
+
+    my %rcpt_hosts = map { ($_ => 1) } $self->qp->config("rcpthosts");
+    return Qpsmtpd::DSN->relaying_denied()
+      unless exists $rcpt_hosts{$host};
+
+    return $self->SUPER::hook_rcpt($transaction, $recipient);
+}
+
+# vim: ts=4 sw=4 expandtab syn=perl
