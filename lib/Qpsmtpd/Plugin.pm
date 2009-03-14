@@ -45,13 +45,27 @@ sub register_hook {
     );
 }
 
+my @isa_plugin_args = ();
+sub set_isa_plugin_args {
+  my $self = shift;
+  $self->{_isa_plugin_args} = 1;
+  @isa_plugin_args = @_;
+}
+
 sub _register {
   my $self = shift;
   my $qp = shift;
   local $self->{_qp} = $qp;
+
+  @isa_plugin_args = ();
   $self->init($qp, @_)     if $self->can('init');
+  $self->{_isa_plugin_args} 
+    and @_ = @isa_plugin_args;
+
   $self->_register_standard_hooks($qp, @_);
   $self->register($qp, @_) if $self->can('register');
+
+  delete $self->{_isa_plugin_args};
 }
 
 sub qp {

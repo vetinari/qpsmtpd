@@ -176,10 +176,18 @@ All valid hooks are defined in F<lib/Qpsmtpd/Plugins.pm>, C<our @hooks>.
 =head2 Inheritance
 
 Inheriting methods from other plugins is an advanced topic. You can alter 
-arguments for the underlying plugin, prepare something for the I<real> 
-plugin or skip a hook with this. Instead of modifying C<@ISA>
+arguments for the underlying plugin (see below), prepare something for the
+C<real> plugin or skip a hook with this. Instead of modifying C<@ISA>
 directly in your plugin, use the C<isa_plugin()> method from the 
-C<init()> subroutine.
+C<init()> subroutine. 
+
+Altering arguments for the C<real> plugin is done by calling 
+C<$self-E<gt>set_isa_plugin_args(@args)> from C<init()>. If you do not 
+call this, the C<real> plugin will receive the same arguments as your 
+plugin (modulo changes done with C<for(@_) { tr/a-z/A-Z/; }> or similar,
+see L<perlsub(1)>): C<init()> and C<register()> are called with the same 
+C<@_> as argument. Deleting or adding plugin arguments B<must> be done with 
+C<set_isa_plugin_args()>.
 
   # rcpt_ok_child
   sub init {
