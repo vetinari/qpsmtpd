@@ -1,0 +1,184 @@
+
+=head1 NAME
+
+lmtp - turn qpsmtpd into an LMTP server (RFC 2033)
+
+=head1 DESCRIPTION
+
+The B<lmtp> plugin turns qpsmtpd into an LMTP server, see RFC 2033. This 
+includes
+
+=over 4
+
+=item * 
+
+removing the C<HELO> and C<EHLO> keywords and adding the C<LHLO> keyword
+
+=item *
+
+change the greeting line to match C</LMTP/> instead of C</E?SMTP/>
+
+=item *
+
+returning the queue status for each recipient separately
+
+=back
+
+The RFC requirement of supporting ENHANCEDSTATUSCODES (RFC 2034) is not 
+implemented: the core lacks support for it.
+
+=head1 CONFIGURATION
+
+The plugin requires that the wanted queue plugin and it's arguments are given
+as the arguments for the I<lmtp> plugin, e.g.:
+
+ lmtp queue/maildir /home/mail/data/%d/%u
+
+Settings that may be changed via the usual qpsmtpd config mechanism (by 
+default small files placed in the F<config/> diretory):
+
+=over 4
+
+=item lmtpgreeting
+
+Set the line which will be sent as initial greeting, note that you B<must> 
+include the string C< LMTP > in this line (unlike qpsmtpd's core setting 
+C<smtpgreeting>).
+
+=back
+
+=head1 NOTES
+
+Auth and TLS are currently not supported.
+
+Only C<OK>, C<DENY(_DISCONNECT)?>, C<DENYSOFT(_DISCONNECT)?> and C<DONE> 
+are supported as return values from queue plugins. The C<_DISCONNECT>
+variants will B<not> disconnect the client, it just behaves like the non
+C<_DISCONNECT> variant.
+
+=cut
+
+use Qpsmtpd::Command;
+use Qpsmtpd::Constants;
+use POSIX qw(strftime);
+
+sub init {
+    my ($self, $qp) = (shift, shift);
+    my $queue = shift @_;
+    die "No args given" unless $queue;
+    $self->set_isa_plugin_args(@_);
+    $self->isa_plugin($queue);
+}
+
+sub hook_ehlo {
+    my $self = shift;
+    $self->qp->respond(500, "Unknown command.", "Hint: try LHLO");
+    return(DONE, "DONE");
+}
+*hook_helo = \&hook_ehlo;
+
+sub hook_connect {
+    my ($self, $transaction) = @_;
+    my $greeting = $self->qp->config("lmtpgreeting");
+    unless ($greeting) {
+        $greeting = $self->qp->config("me") 
+                . " LMTP qpsmtpd " 
+                . $self->qp->version
+                . " ready.";
+    }
+    $self->qp->respond(220, $greeting);
+    return DONE;
+}
+
+sub hook_unrecognized_command {
+    my ($self, $transaction, $cmd, @args) = @_;
+    return DECLINED unless $cmd eq 'lhlo';
+
+    my $hello_host = shift @args;
+    unless ($hello_host) {
+        $self->qp->respond(501, "LHLO requires domain/address");
+        return DONE;
+    }
+
+    my $conn = $self->qp->connection;
+    if ($conn->hello) {
+        $self->qp->respond(503, "But you already said hello...");
+        return DONE;
+    }
+
+    $conn->hello("lhlo");
+    $conn->hello_host($hello_host);
+    $self->qp->transaction;
+    my @cap = $self->transaction->notes('capabilities')
+                ? @{ $self->transaction->notes('capabilities') }
+                : ();
+    $self->qp->respond(250, 
+        $self->qp->config("me")
+            . " Hi " . $conn->remote_info . " [" . $conn->remote_ip . "]",
+        "PIPELINING",
+        "8BITMIME",
+        ($self->qp->config('databytes') 
+            ? "SIZE ". ($self->config('databytes'))[0] 
+            : ()),
+        @cap,
+        );
+    return DONE;
+}
+
+sub hook_data {
+    my ($self, $transaction) = @_;
+    unless ($transaction->recipients) {
+        my $msg = "No valid recipients";
+        $self->qp->respond(503, $msg);
+        return DONE;
+    }
+    return DECLINED;
+}
+
+sub hook_queue {
+    my ($self, $transaction) = @_;
+    my @rcpts = $transaction->recipients;
+    $self->qp->respond(250, "OK, recipient codes follow");
+    foreach my $rcpt (@rcpts) {
+        # set exactly one recipient and queue the message
+        $transaction->recipients($rcpt);
+        my ($rc, @msg) = $self->SUPER::hook_queue($transaction);
+
+        next if $rc == DONE;
+        if ($rc == OK) {
+            $self->qp->respond(250, "Mail queued for $rcpt");
+        }
+
+        elsif ($rc == DENY || $rc == DENY_DISCONNECT) {
+            @msg or $msg[0] = "Queue denied for $rcpt";
+            $self->qp->respond(550, @msg);
+        }
+
+        elsif ($rc == DENYSOFT || $rc == DENYSOFT_DISCONNECT) {
+            @msg or $msg[0] = "Temporary queue error for $rcpt";
+            $self->qp->respond(452, @msg);
+        }
+
+        else {
+            my $code = Qpsmtpd::Constants::return_code($rc) 
+                        ? Qpsmtpd::Constants::return_code($rc) 
+                        : "UNKNOWN";
+            $self->qp->log(LOGERROR, 
+                           "Queue plugin returned invalid constant $code");
+            $self->qp->respond(452, "$rcpt temporarily failed: internal error");
+        }
+    }
+    return DONE;
+}
+
+sub hook_received_line {
+    my ($self, $transaction) = @_;
+    return OK, 
+        "from " . $self->qp->connection->remote_info
+        ." (". $self->connection->remote_ip . ")\n"
+        ."\tby ".$self->qp->config('me')." (qpsmtpd/".$self->qp->version.")"
+        ." with LMTP "
+        .(strftime('%a, %d %b %Y %H:%M:%S %z', localtime));
+}
+
+# vim: ts=4 sw=4 expandtab syn=perl
